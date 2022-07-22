@@ -97,7 +97,8 @@ class DecoderModel(ModelBase):
 
     def forward(self, batch, prefixlm=False):
         device = batch["input_ids"].device
-        bs, prefix_len = batch["input_ids"].shape
+        bs, inp_len = batch["input_ids"].shape
+        prefix_length = torch.where(batch["input_ids"] != 3, 1, 0).sum(-1)
 
         model_inputs = {
             "input_ids": torch.cat([batch["input_ids"], batch["labels"]], dim=-1),
@@ -117,15 +118,33 @@ class DecoderModel(ModelBase):
             # Get mask for input & target padding
             mask = _expand_mask(model_inputs["attention_mask"], dtype)
 
-            # Create causal mask for targets
-            labels_causal_mask = (1 - torch.tril(torch.ones((bs, 1, lab_len, lab_len), device=device, dtype=dtype)))
-            labels_causal_mask = torch.cat([torch.ones((bs,1,prefix_len,lab_len), device=device, dtype=dtype),labels_causal_mask], dim=-2)
+            ## Create causal mask for targets
+            #labels_causal_mask = (1 - torch.tril(torch.ones((bs, 1, lab_len, lab_len), device=device, dtype=dtype)))
+            #labels_causal_mask = torch.cat([torch.ones((bs,1,prefix_len,lab_len), device=device, dtype=dtype),labels_causal_mask], dim=-2)
 
-            # Add causal mask for targets & let inputs attend bidirectionally
-            mask[:, :, :, prefix_len:] += labels_causal_mask.masked_fill(labels_causal_mask.to(torch.bool), -torch.inf)
-            model_inputs["causal_mask"] = mask
+            ## Add causal mask for targets & let inputs attend bidirectionally
+            #mask[:, :, :, prefix_len:] += labels_causal_mask.masked_fill(labels_causal_mask.to(torch.bool), -torch.inf)
 
-        logits = self._model(**model_inputs).logits[:, prefix_len-1:-1]
+            full_length = inp_len + lab_len
+            causal_mask = (torch.tril(torch.ones((full_length, full_length), dtype=torch.bool)).view(1, 1, full_length, full_length)).to(
+                device
+            )
+
+            prefix_mask = torch.zeros((prefix_length.shape[0], 1, full_length, full_length), dtype=torch.bool).to(device)
+            for idx in range(prefix_length.shape[0]):
+                prefix_mask_length = int(prefix_length[idx])
+                prefix_start_idx = inp_len - prefix_mask_length
+                prefix_end_idx = inp_len
+                prefix_mask[idx, :, :prefix_end_idx, :prefix_end_idx] = 1
+                prefix_mask[idx, :, :prefix_start_idx, :prefix_start_idx] = 0
+
+            causal_mask = (causal_mask + prefix_mask).bool()
+            current_causal_mask = causal_mask[:, :, :full_length, :full_length]
+
+            model_inputs["causal_mask"] = current_causal_mask
+
+        torch.save(model_inputs, 'model_inputs.pt')
+        logits = self._model(**model_inputs).logits[:, inp_len-1:-1]
         masked_log_probs = batch["labels_attention_mask"].unsqueeze(-1) * torch.log_softmax(logits, dim=-1)
         seq_token_log_probs = torch.gather(masked_log_probs, -1, batch["labels"].unsqueeze(-1))
         seq_log_prob = seq_token_log_probs.squeeze(dim=-1).sum(dim=-1)
